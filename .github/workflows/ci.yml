@@ -1,0 +1,356 @@
+# Copyright (c) 2025-2026 fei_cong(https://github.com/feicong/feicong-course)
+
+name: ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Target release tag (leave empty to use "latest")
+        required: false
+        default: ""
+        type: string
+      upload:
+        description: Upload artifacts to Release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      release_name: ${{ steps.vars.outputs.release_name }}
+      upload: ${{ steps.vars.outputs.upload }}
+    steps:
+      - name: Compute variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag='latest'
+          upload='true'
+
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            if [ -n '${{ inputs.release_tag }}' ]; then
+              release_tag='${{ inputs.release_tag }}'
+            fi
+            upload='${{ inputs.upload }}'
+          fi
+
+          release_name="DeClang (${release_tag})"
+
+          {
+            echo "release_tag=$release_tag"
+            echo "release_name=$release_name"
+            echo "upload=$upload"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: prepare
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            runs_on: ubuntu-22.04
+            archive_ext: tar.gz
+          - label: macos
+            runs_on: macos-15
+            archive_ext: tar.gz
+          - label: windows
+            runs_on: windows-2022
+            archive_ext: zip
+
+    steps:
+      - name: Checkout DeClang source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja cmake
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ninja cmake --yes --no-progress
+          cmake --version
+          ninja --version
+
+      - name: Setup symlinks (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f clang/lib/Driver/DeClangExtraProcess.cpp
+          rm -rf llvm/lib/Transforms/AntiHack
+          rm -rf llvm/include/llvm/Transforms/AntiHack
+          ln -s ../../../AntiHackOSS/clang/DeClangExtraProcess.cpp clang/lib/Driver/DeClangExtraProcess.cpp
+          ln -s ../../../AntiHackOSS/src llvm/lib/Transforms/AntiHack
+          ln -s ../../../../AntiHackOSS/include llvm/include/llvm/Transforms/AntiHack
+
+      - name: Setup symlinks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Remove old files/dirs if they exist
+          if (Test-Path "clang\lib\Driver\DeClangExtraProcess.cpp") {
+            Remove-Item "clang\lib\Driver\DeClangExtraProcess.cpp" -Force
+          }
+          if (Test-Path "llvm\lib\Transforms\AntiHack") {
+            Remove-Item "llvm\lib\Transforms\AntiHack" -Recurse -Force
+          }
+          if (Test-Path "llvm\include\llvm\Transforms\AntiHack") {
+            Remove-Item "llvm\include\llvm\Transforms\AntiHack" -Recurse -Force
+          }
+          # Create junctions (directory symlinks) and file hardlinks for Windows
+          $root = (Get-Location).Path
+          Copy-Item "$root\AntiHackOSS\clang\DeClangExtraProcess.cpp" "$root\clang\lib\Driver\DeClangExtraProcess.cpp"
+          cmd /c mklink /J "$root\llvm\lib\Transforms\AntiHack" "$root\AntiHackOSS\src"
+          cmd /c mklink /J "$root\llvm\include\llvm\Transforms\AntiHack" "$root\AntiHackOSS\include"
+
+      - name: Configure (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cmake \
+            -S llvm \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_DUMP=ON \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+            -DCLANG_DEFAULT_RTLIB="libgcc"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          cmake `
+            -S llvm `
+            -B build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_ENABLE_DUMP=ON `
+            -DLLVM_ENABLE_ZSTD=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_ENABLE_PROJECTS="clang" `
+            -DLLVM_USE_CRT_RELEASE=MT `
+            -DLLVM_USE_CRT_RELWITHDEBINFO=MT `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+          cmake --build build --parallel "$jobs" --target clang
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        id: package_unix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${RUNNER_OS}" in
+            Linux)
+              case "$(uname -m)" in
+                x86_64)   host="x86_64-linux-gnu" ;;
+                aarch64)  host="aarch64-linux-gnu" ;;
+                *)        host="$(uname -m)-linux-gnu" ;;
+              esac
+              ;;
+            macOS)
+              case "$(uname -m)" in
+                x86_64) host="x86_64-apple-darwin" ;;
+                arm64)  host="aarch64-apple-darwin" ;;
+                *)      host="$(uname -m)-apple-darwin" ;;
+              esac
+              ;;
+          esac
+
+          pkg_dir="$RUNNER_TEMP/declang-package"
+          compiler_dir="$pkg_dir/compiler"
+          mkdir -p "$compiler_dir/bin"
+          mkdir -p "$compiler_dir/lib"
+
+          cp build/bin/clang   "$compiler_dir/bin/"
+          cp build/bin/clang++ "$compiler_dir/bin/"
+          cp -r build/lib/clang "$compiler_dir/lib/clang"
+
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            mkdir -p "$compiler_dir/usr/bin"
+            ln -s ../../bin/clang   "$compiler_dir/usr/bin/clang"
+            ln -s ../../bin/clang++ "$compiler_dir/usr/bin/clang++"
+          fi
+
+          cp AntiHackOSS/LICENSE-DeClang "$pkg_dir/"
+          cp AntiHackOSS/LICENSE-ollvm   "$pkg_dir/"
+          cp LICENSE.TXT                 "$pkg_dir/"
+
+          archive_name="declang-${{ needs.prepare.outputs.release_tag }}-${host}.${{ matrix.archive_ext }}"
+          archive_path="$GITHUB_WORKSPACE/$archive_name"
+          tar -C "$pkg_dir" -czf "$archive_path" .
+
+          echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
+          echo "archive_name=$archive_name" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        id: package_windows
+        shell: pwsh
+        run: |
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          if ($arch -eq "AMD64") { $targetTriple = "x86_64-windows-msvc" }
+          elseif ($arch -eq "ARM64") { $targetTriple = "aarch64-windows-msvc" }
+          else { $targetTriple = "$arch-windows-msvc" }
+
+          $pkgDir = "$env:RUNNER_TEMP\declang-package"
+          $compilerDir = "$pkgDir\compiler"
+          New-Item -ItemType Directory -Force -Path "$compilerDir\bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$compilerDir\lib" | Out-Null
+
+          Copy-Item "build\bin\clang.exe"   "$compilerDir\bin\"
+          Copy-Item "build\bin\clang++.exe" "$compilerDir\bin\"
+          if (Test-Path "build\bin\clang-cl.exe") {
+            Copy-Item "build\bin\clang-cl.exe" "$compilerDir\bin\"
+          }
+          Copy-Item -Recurse "build\lib\clang" "$compilerDir\lib\clang"
+
+          Copy-Item "AntiHackOSS\LICENSE-DeClang" "$pkgDir\"
+          Copy-Item "AntiHackOSS\LICENSE-ollvm"   "$pkgDir\"
+          Copy-Item "LICENSE.TXT"                 "$pkgDir\"
+
+          $archiveName = "declang-${{ needs.prepare.outputs.release_tag }}-$targetTriple.${{ matrix.archive_ext }}"
+          $archivePath = "$env:GITHUB_WORKSPACE\$archiveName"
+
+          Compress-Archive -Path "$pkgDir\*" -DestinationPath $archivePath -Force
+
+          echo "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+          echo "archive_name=$archiveName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-artifact
+          path: ${{ runner.os != 'Windows' && steps.package_unix.outputs.archive_path || steps.package_windows.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: ${{ needs.prepare.outputs.upload == 'true' }}
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh release-assets/
+
+      - name: Update release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${{ needs.prepare.outputs.release_tag }}" "${{ github.sha }}"
+          git push origin "refs/tags/${{ needs.prepare.outputs.release_tag }}" --force
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' \
+              "## DeClang Build" \
+              "" \
+              "**Release tag:** \`${{ needs.prepare.outputs.release_tag }}\`" \
+              "**Commit:** \`${{ github.sha }}\`" \
+              "**Branch:** \`${{ github.ref_name }}\`" \
+              "" \
+              "### Platforms" \
+              "- Linux (x86_64)" \
+              "- macOS (x86_64 / arm64)" \
+              "- Windows (x86_64)" \
+              "" \
+              "### Usage" \
+              "" \
+              "Extract the archive and set \`DECLANG_HOME\` to the extracted directory." \
+              "Refer to the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for setup instructions."
+          } > release-notes.md
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body_path: release-notes.md
+          files: release-assets/*
+          make_latest: true
