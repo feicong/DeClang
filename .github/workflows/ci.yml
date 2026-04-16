@@ -69,7 +69,7 @@ jobs:
             runs_on: ubuntu-22.04
             archive_ext: tar.gz
           - label: macos
-            runs_on: macos-13
+            runs_on: macos-15
             archive_ext: tar.gz
           - label: windows
             runs_on: windows-2022
