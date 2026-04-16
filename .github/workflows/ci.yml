@@ -197,7 +197,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake --build build --parallel $(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4) --target clang
+          jobs=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+          cmake --build build --parallel "$jobs" --target clang
 
       - name: Package (Linux/macOS)
         if: runner.os != 'Windows'
